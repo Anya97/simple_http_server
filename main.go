@@ -1,82 +1,118 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"github.com/Anya97/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/exp/slog"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-const serverPort = 3333
-
 func main() {
 	type Counter struct {
-		TotalRequestsCount      int // Число запросов /ping
-		TotalRequestErrorsCount int // Число запросов с 400 ответом
-		TotalServerErrorsCount  int // Число запросов с 500 ответом
+		TotalRequestsCount      int64 `json:"total_requests_count"`       // Число запросов /ping
+		TotalRequestErrorsCount int64 `json:"total_request_errors_count"` // Число запросов с 400 ответом
+		TotalServerErrorsCount  int64 `json:"total_server_errors_count"`  // Число запросов с 500 ответом
 	}
 	counter := Counter{}
 
-	histogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name: "ping_seconds",
-		Help: "Time taken to create hashes",
-	}, []string{"code"})
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	config := config.GetConfig()
+
+	requestsCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "requests_counter",
+		Help: "Total count of requests",
+	}, []string{"status_code", "endpoint"})
+
+	histogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "http_requests_seconds",
+		Help: "Time taken to create hashes",
+	}, []string{"status_code", "endpoint"})
+
 	mux := http.NewServeMux()
+	logger.Info("Started application")
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		code := 200
+		code := http.StatusOK
 		logger.Info("request:" + r.Method)
 		defer func() {
 			if r := recover(); r != nil {
-				code = 500
-				w.WriteHeader(500)
-				logger.Error("Internal server error", r)
-				counter.TotalServerErrorsCount++
+				code = http.StatusInternalServerError
+				w.WriteHeader(http.StatusInternalServerError)
+				logger.With(r).Error("Internal server error")
+				atomic.AddInt64(&counter.TotalServerErrorsCount, 1)
+				requestsCounter.WithLabelValues(strconv.Itoa(code), "ping").Inc()
 			}
 			duration := time.Since(start)
-			histogram.WithLabelValues(fmt.Sprintf("%d", code)).Observe(duration.Seconds())
+			histogram.WithLabelValues(strconv.Itoa(code), "ping").Observe(duration.Seconds())
 		}()
 		randomNum := rand.Intn(10000-100) + 100
-		counter.TotalRequestsCount++
-		time.Sleep(time.Duration(randomNum) * time.Microsecond)
-		if rand.Intn(10) == 8 {
-			code = 400
-			w.WriteHeader(400)
-			counter.TotalRequestErrorsCount++
-			logger.Warn("Request error")
-		} else if rand.Intn(20) == 8 {
+		atomic.AddInt64(&counter.TotalRequestsCount, 1)
+		requestsCounter.WithLabelValues(strconv.Itoa(code), "ping").Inc()
+		time.Sleep(time.Duration(randomNum) * time.Millisecond)
+
+		v := rand.Intn(100)
+
+		if v < 5 {
+			code = http.StatusBadRequest
+			w.WriteHeader(code)
+			atomic.AddInt64(&counter.TotalRequestErrorsCount, 1)
+			requestsCounter.WithLabelValues(strconv.Itoa(code), "ping").Inc()
+			logger.With(code).Warn("Request error in /ping")
+		} else if v < 15 {
 			panic("AAAAAAA")
 		}
 	})
+
 	mux.HandleFunc("/requests_counter", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		err := json.NewEncoder(w).Encode(counter)
 		if err != nil {
-			logger.Error("Json encode error")
+			logger.With(err).Error("Json encode error")
 		}
+		histogram.WithLabelValues(strconv.Itoa(http.StatusOK), "requests_counter").Observe(time.Since(start).Seconds())
+		requestsCounter.WithLabelValues(strconv.Itoa(http.StatusOK), "requests_counter").Inc()
 	})
-	mux.Handle("/metrics", prometheusHandler())
 
-	prometheus.Register(histogram)
+	mux.Handle("/metrics", promhttp.Handler())
+
+	err := prometheus.Register(histogram)
+	if err != nil {
+		logger.With(err).Error("Register error")
+	}
 
 	server := http.Server{
-		Addr:    fmt.Sprintf(":%d", serverPort),
+		Addr:    ":" + config.Port,
 		Handler: mux,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
-		if !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("error running http server: %s\n", err)
-		}
-	}
-}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-func prometheusHandler() http.Handler {
-	return promhttp.Handler()
+	go func() {
+		if err := server.ListenAndServe(); err != nil {
+			if !errors.Is(err, http.ErrServerClosed) {
+				logger.With(err).Error("error running http server")
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	logger.Info("got interruption signal")
+	if err := server.Shutdown(context.TODO()); err != nil {
+		logger.With(err).Info("server shutdown returned an err")
+	}
+
+	log.Println("final")
 }
