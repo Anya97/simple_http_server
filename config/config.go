@@ -11,7 +11,7 @@ type Config struct {
 
 func GetConfig() *Config {
 	return &Config{
-		Port: getEnv("PORT", "3333"),
+		Port: getEnv("PORT", "11111"),
 	}
 }
 
